@@ -16,7 +16,7 @@ mod tests;
 
 use crate::{
     Error, Result,
-    system_load::Stop,
+    pace::{Intervals, Pace, Schedule},
     usage::{Host, Shell},
 };
 use herdr_client::ConnectTarget;
@@ -35,8 +35,14 @@ pub(crate) use tunnel::Tunnels;
 #[cfg(all(test, unix))]
 pub(crate) use tunnel::{Key, Tunnel};
 
-/// Ports open and close at human pace; `lsof` is not free on a busy machine.
-const INTERVAL: Duration = Duration::from_secs(5);
+/// Ports open and close at human pace, and `lsof` is not free on a busy
+/// machine, so a window the user is not working in scans less often and a
+/// covered one rarely.
+const INTERVALS: Intervals = Intervals {
+    active: Duration::from_secs(5),
+    shown: Duration::from_secs(15),
+    hidden: Duration::from_secs(60),
+};
 /// A host that could not be scanned is tried again after this long.
 const RETRY: Duration = Duration::from_secs(30);
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -169,26 +175,26 @@ fn failed(error: Error) -> Error {
 }
 
 struct Worker {
-    stop: Arc<Stop>,
+    schedule: Arc<Schedule>,
     results: mpsc::Receiver<Result<Scan>>,
 }
 
 impl Drop for Worker {
     /// The thread ends after its current scan; nothing waits for it here.
     fn drop(&mut self) {
-        self.stop.stop();
+        self.schedule.stop();
     }
 }
 
-fn spawn(host: Host) -> Option<Worker> {
-    let stop = Arc::new(Stop::default());
+fn spawn(host: Host, pace: Pace) -> Option<Worker> {
+    let schedule = Arc::new(Schedule::new(pace));
     let (sender, results) = mpsc::sync_channel(2);
-    let shared = stop.clone();
+    let shared = schedule.clone();
     let spawned = thread::Builder::new()
         .name("herdr-listening-ports".into())
         .spawn(move || run(&host, &shared, &sender));
     match spawned {
-        Ok(_) => Some(Worker { stop, results }),
+        Ok(_) => Some(Worker { schedule, results }),
         Err(error) => {
             tracing::warn!(category = "listening-ports", %error, "could not start a port scanner");
             None
@@ -196,7 +202,7 @@ fn spawn(host: Host) -> Option<Worker> {
     }
 }
 
-fn run(host: &Host, stop: &Stop, results: &mpsc::SyncSender<Result<Scan>>) {
+fn run(host: &Host, schedule: &Schedule, results: &mpsc::SyncSender<Result<Scan>>) {
     let origin = origin(host);
     let mut shell: Option<Shell> = None;
     loop {
@@ -215,13 +221,15 @@ fn run(host: &Host, stop: &Stop, results: &mpsc::SyncSender<Result<Scan>>) {
                 origin: origin.clone(),
             })
         });
-        let due = Instant::now() + if result.is_ok() { INTERVAL } else { RETRY };
+        let succeeded = result.is_ok();
+        let finished = Instant::now();
         match results.try_send(result) {
             // The UI is behind; it will take the next one.
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => return,
         }
-        if !stop.wait(due) {
+        let interval = |pace| if succeeded { INTERVALS.at(pace) } else { RETRY };
+        if !schedule.wait(finished, interval) {
             return;
         }
     }
@@ -333,10 +341,10 @@ impl ListeningPorts {
         );
     }
 
-    /// Scans exactly `hosts` (at most [`HOST_LIMIT`]): starts workers for new
-    /// ones, stops and forgets the rest, and takes finished scans. Returns
-    /// whether anything shown changed.
-    pub fn poll(&mut self, hosts: impl IntoIterator<Item = Host>) -> bool {
+    /// Scans exactly `hosts` (at most [`HOST_LIMIT`]) at `pace`: starts
+    /// workers for new ones, stops and forgets the rest, and takes finished
+    /// scans. Returns whether anything shown changed.
+    pub fn poll(&mut self, hosts: impl IntoIterator<Item = Host>, pace: Pace) -> bool {
         let mut wanted: Vec<Host> = Vec::new();
         for host in hosts {
             if wanted.len() == HOST_LIMIT {
@@ -357,11 +365,14 @@ impl ListeningPorts {
             self.monitors
                 .entry(host)
                 .or_insert_with_key(|host| Monitor {
-                    worker: spawn(host.clone()),
+                    worker: spawn(host.clone(), pace),
                     reading: Reading::default(),
                 });
         }
         for monitor in self.monitors.values_mut() {
+            if let Some(worker) = &monitor.worker {
+                worker.schedule.set_pace(pace);
+            }
             while let Some(worker) = &monitor.worker {
                 match worker.results.try_recv() {
                     Ok(result) => changed |= monitor.reading.apply(result),

@@ -1,13 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::{
-    HISTORY, Reading, Source, Stop, SystemLoad,
+    HISTORY, Reading, Source, SystemLoad,
     render::gigabytes,
     sample::{Memory, Os, Sample, parse},
 };
-use crate::{Error, usage::Host};
+use crate::{Error, pace::Pace, usage::Host};
 use std::{
-    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -133,19 +132,6 @@ fn uname_selects_the_command() {
 }
 
 #[test]
-fn a_stopped_worker_wakes_at_once() {
-    let stop = Arc::new(Stop::default());
-    assert!(stop.wait(Instant::now()), "a due sample is taken");
-    let waiter = {
-        let stop = stop.clone();
-        thread::spawn(move || stop.wait(Instant::now() + Duration::from_secs(3600)))
-    };
-    stop.stop();
-    assert!(!waiter.join().unwrap());
-    assert!(!stop.wait(Instant::now()), "stopped stays stopped");
-}
-
-#[test]
 fn history_is_bounded_and_a_failure_keeps_the_last_sample() {
     let mut reading = Reading::default();
     for index in 0..HISTORY + 3 {
@@ -182,7 +168,7 @@ fn a_wanted_host_is_sampled_and_a_dropped_one_forgotten() {
     let local = Host::Local;
     // Starting a worker shows nothing new by itself, but a fast machine can
     // answer before this same poll drains it, which is a change.
-    let changed = load.poll([local.clone()]);
+    let changed = load.poll([local.clone()], Pace::Active);
     let reading = load.get(&local).unwrap();
     assert_eq!(
         changed,
@@ -191,15 +177,15 @@ fn a_wanted_host_is_sampled_and_a_dropped_one_forgotten() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while load.get(&local).and_then(Reading::latest).is_none() {
         assert!(Instant::now() < deadline, "this machine never answered");
-        load.poll([local.clone()]);
+        load.poll([local.clone()], Pace::Active);
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        load.poll(std::iter::empty()),
+        load.poll(std::iter::empty(), Pace::Active),
         "dropping a host changes what is shown"
     );
     assert!(load.get(&local).is_none());
-    assert!(!load.poll(std::iter::empty()));
+    assert!(!load.poll(std::iter::empty(), Pace::Active));
 }
 
 #[test]
