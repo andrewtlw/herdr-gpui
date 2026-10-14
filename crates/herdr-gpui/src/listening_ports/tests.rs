@@ -5,7 +5,7 @@ use super::{
     scan::{Bind, Link, MAX_PORTS, Origin, Port, Ports, parse},
     tunnel::{self, Key},
 };
-use crate::{Error, usage::Host};
+use crate::{Error, pace::Pace, usage::Host};
 use herdr_client::ConnectTarget;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -247,7 +247,7 @@ fn seeded_hosts_are_looked_up_by_workspace_and_forgotten_when_dropped() {
             .is_none()
     );
     // A host still wanted keeps its reading; no worker is started for it.
-    assert!(!ports.poll([host.clone(), host.clone()]));
+    assert!(!ports.poll([host.clone(), host.clone()], Pace::Active));
     assert_eq!(
         ports
             .get(&daemon, "w1")
@@ -255,11 +255,11 @@ fn seeded_hosts_are_looked_up_by_workspace_and_forgotten_when_dropped() {
         1
     );
     assert!(
-        ports.poll(std::iter::empty()),
+        ports.poll(std::iter::empty(), Pace::Active),
         "dropping shown ports is a change"
     );
     assert!(ports.get(&daemon, "w1").is_none());
-    assert!(!ports.poll(std::iter::empty()));
+    assert!(!ports.poll(std::iter::empty(), Pace::Active));
 }
 
 /// The real step against this machine's own tools: a socket this test holds
@@ -794,3 +794,6 @@ fn a_local_port_is_never_handed_back_to_a_previous_remote_port() {
     assert_eq!(tunnels.begin(&first), Some(None));
     tunnels.retain(|_| false);
 }
+
+#[cfg(unix)]
+mod pane_environment;

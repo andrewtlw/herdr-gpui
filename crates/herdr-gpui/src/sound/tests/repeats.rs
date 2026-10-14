@@ -5,7 +5,7 @@ fn send(service: &Service, boot: Option<&str>, event: SemanticNotification, queu
         .sender
         .as_ref()
         .unwrap()
-        .send(Job {
+        .send(Wake::Play(Box::new(Job {
             request: PlaybackRequest::Notification {
                 boot: boot.map(str::to_owned),
                 event,
@@ -13,7 +13,7 @@ fn send(service: &Service, boot: Option<&str>, event: SemanticNotification, queu
             cancel: Arc::new(AtomicBool::new(false)),
             connection_cancel: Arc::new(AtomicBool::new(false)),
             queued,
-        })
+        })))
         .unwrap();
 }
 

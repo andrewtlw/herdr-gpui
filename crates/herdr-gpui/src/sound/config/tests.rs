@@ -148,7 +148,7 @@ fn bounded_reads_preserve_sources() {
 
 #[test]
 fn worker_reloads_asynchronously_and_keeps_last_valid_config() {
-    use super::super::{Job, Service};
+    use super::super::{Job, Service, Wake};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -184,7 +184,7 @@ fn worker_reloads_asynchronously_and_keeps_last_valid_config() {
             .sender
             .as_ref()
             .unwrap()
-            .send(Job {
+            .send(Wake::Play(Box::new(Job {
                 request: crate::sound::PlaybackRequest::Notification {
                     boot: None,
                     event: herdr_client::protocol::SemanticNotification {
@@ -202,7 +202,7 @@ fn worker_reloads_asynchronously_and_keeps_last_valid_config() {
                 cancel: Arc::new(AtomicBool::new(false)),
                 connection_cancel: Arc::new(AtomicBool::new(false)),
                 queued: Instant::now(),
-            })
+            })))
             .unwrap();
     };
     wait_loaded(1);
@@ -214,7 +214,7 @@ fn worker_reloads_asynchronously_and_keeps_last_valid_config() {
             Path::new("/local/config.toml"),
         ))
         .unwrap();
-    service.reload.store(true, Ordering::Release);
+    service.reload();
     wait_loaded(2);
     send("reloaded");
     assert_eq!(
@@ -222,7 +222,7 @@ fn worker_reloads_asynchronously_and_keeps_last_valid_config() {
         Some("/local/new.mp3".into())
     );
     loads.send(Err(Error::SoundConfigSize)).unwrap();
-    service.reload.store(true, Ordering::Release);
+    service.reload();
     wait_loaded(3);
     send("retained");
     assert_eq!(

@@ -13,6 +13,7 @@ mod tests;
 
 use crate::{
     Error, Result,
+    pace::{Intervals, Pace, Schedule},
     usage::{Host, Shell},
 };
 pub(crate) use render::{
@@ -26,12 +27,18 @@ use sample::Sample;
 use sample::{Disk, Memory, Os, Ticks};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Condvar, Mutex, PoisonError, mpsc},
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-const INTERVAL: Duration = Duration::from_secs(2);
+/// The status bar's CPU figure is worth refreshing often only while the user
+/// works in the window; a covered window does not need it at all.
+const INTERVALS: Intervals = Intervals {
+    active: Duration::from_secs(2),
+    shown: Duration::from_secs(5),
+    hidden: Duration::from_secs(30),
+};
 /// A host that could not be reached is tried again after this long.
 const RETRY: Duration = Duration::from_secs(30);
 /// macOS hosts spend one second of this measuring CPU.
@@ -169,61 +176,27 @@ fn remote(error: Error) -> Error {
     Error::SystemLoadRemote(Box::new(error))
 }
 
-/// Tells a worker to stop, waking it from its wait between samples. The
-/// listening-port scanners stop the same way.
-#[derive(Default)]
-pub(crate) struct Stop {
-    stopped: Mutex<bool>,
-    changed: Condvar,
-}
-
-impl Stop {
-    pub(crate) fn stop(&self) {
-        *self.stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        self.changed.notify_all();
-    }
-
-    /// Waits until `due`; false once stopped.
-    pub(crate) fn wait(&self, due: Instant) -> bool {
-        let mut stopped = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if *stopped {
-                return false;
-            }
-            let now = Instant::now();
-            if now >= due {
-                return true;
-            }
-            stopped = self
-                .changed
-                .wait_timeout(stopped, due - now)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-    }
-}
-
 struct Worker {
-    stop: Arc<Stop>,
+    schedule: Arc<Schedule>,
     results: mpsc::Receiver<Result<Sample>>,
 }
 
 impl Drop for Worker {
     /// The thread ends after its current sample; nothing waits for it here.
     fn drop(&mut self) {
-        self.stop.stop();
+        self.schedule.stop();
     }
 }
 
-fn spawn(host: Host) -> Option<Worker> {
-    let stop = Arc::new(Stop::default());
+fn spawn(host: Host, pace: Pace) -> Option<Worker> {
+    let schedule = Arc::new(Schedule::new(pace));
     let (sender, results) = mpsc::sync_channel(4);
-    let shared = stop.clone();
+    let shared = schedule.clone();
     let spawned = thread::Builder::new()
         .name("herdr-system-load".into())
         .spawn(move || run(&host, &shared, &sender));
     match spawned {
-        Ok(_) => Some(Worker { stop, results }),
+        Ok(_) => Some(Worker { schedule, results }),
         Err(error) => {
             tracing::warn!(category = "system-load", %error, "could not start a CPU and memory worker");
             None
@@ -231,7 +204,7 @@ fn spawn(host: Host) -> Option<Worker> {
     }
 }
 
-fn run(host: &Host, stop: &Stop, results: &mpsc::SyncSender<Result<Sample>>) {
+fn run(host: &Host, schedule: &Schedule, results: &mpsc::SyncSender<Result<Sample>>) {
     let mut source: Option<Source> = None;
     loop {
         let opened = match source.take() {
@@ -246,13 +219,15 @@ fn run(host: &Host, stop: &Stop, results: &mpsc::SyncSender<Result<Sample>>) {
             }
             sample
         });
-        let due = Instant::now() + if result.is_ok() { INTERVAL } else { RETRY };
+        let succeeded = result.is_ok();
+        let finished = Instant::now();
         match results.try_send(result) {
             // The UI is behind; it will take the next one.
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
             Err(mpsc::TrySendError::Disconnected(_)) => return,
         }
-        if !stop.wait(due) {
+        let interval = |pace| if succeeded { INTERVALS.at(pace) } else { RETRY };
+        if !schedule.wait(finished, interval) {
             return;
         }
     }
@@ -326,10 +301,10 @@ impl SystemLoad {
         self.monitors.get(host).map(|monitor| &monitor.reading)
     }
 
-    /// Samples exactly `hosts` (at most [`HOST_LIMIT`]): starts workers for
-    /// new ones, stops and forgets the rest, and takes finished samples.
-    /// Returns whether anything shown changed.
-    pub fn poll(&mut self, hosts: impl IntoIterator<Item = Host>) -> bool {
+    /// Samples exactly `hosts` (at most [`HOST_LIMIT`]) at `pace`: starts
+    /// workers for new ones, stops and forgets the rest, and takes finished
+    /// samples. Returns whether anything shown changed.
+    pub fn poll(&mut self, hosts: impl IntoIterator<Item = Host>, pace: Pace) -> bool {
         let wanted: Vec<Host> = hosts.into_iter().take(HOST_LIMIT).collect();
         let before = self.monitors.len();
         self.monitors.retain(|host, _| wanted.contains(host));
@@ -338,11 +313,14 @@ impl SystemLoad {
             self.monitors
                 .entry(host)
                 .or_insert_with_key(|host| Monitor {
-                    worker: spawn(host.clone()),
+                    worker: spawn(host.clone(), pace),
                     reading: Reading::default(),
                 });
         }
         for monitor in self.monitors.values_mut() {
+            if let Some(worker) = &monitor.worker {
+                worker.schedule.set_pace(pace);
+            }
             while let Some(worker) = &monitor.worker {
                 match worker.results.try_recv() {
                     Ok(result) => {

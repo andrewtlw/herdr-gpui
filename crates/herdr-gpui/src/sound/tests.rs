@@ -307,7 +307,8 @@ fn disconnect_boot_and_detach_cancel_pending_and_queued_generations() {
 
 #[test]
 fn service_nonblocking_queue_bound_reload_and_move_once() {
-    let (sender, receiver) = mpsc::sync_channel(1);
+    // One sound, plus the reload wake beside it.
+    let (sender, receiver) = mpsc::sync_channel(2);
     let service = Service {
         sender: Some(sender),
         settings: Arc::new(Mutex::new(Some(Arc::new(Settings::default())))),
@@ -325,7 +326,8 @@ fn service_nonblocking_queue_bound_reload_and_move_once() {
     service.poll(&mut policy, &mut state, false, now);
     assert!(service.reload.load(Ordering::Acquire));
     assert!(!state.reload_sound);
-    assert!(receiver.try_recv().is_ok());
+    assert!(matches!(receiver.try_recv(), Ok(Wake::Reload)));
+    assert!(matches!(receiver.try_recv(), Ok(Wake::Play(_))));
     assert!(receiver.try_recv().is_err());
     service.poll(&mut policy, &mut state, false, now);
     assert!(receiver.try_recv().is_err());
@@ -358,7 +360,7 @@ fn preview_uses_builtin_on_worker_despite_notification_mute() {
         .sender
         .as_ref()
         .unwrap()
-        .send(Job {
+        .send(Wake::Play(Box::new(Job {
             request: PlaybackRequest::Notification {
                 boot: None,
                 event: event(Kind::Custom),
@@ -366,7 +368,7 @@ fn preview_uses_builtin_on_worker_despite_notification_mute() {
             cancel: Arc::new(AtomicBool::new(false)),
             connection_cancel: Arc::new(AtomicBool::new(false)),
             queued: Instant::now(),
-        })
+        })))
         .unwrap();
     service.preview();
     assert_eq!(
@@ -392,7 +394,9 @@ fn preview_queue_is_bounded_and_uses_service_cancellation() {
     };
     service.preview();
     service.preview();
-    let job = receiver.try_recv().unwrap();
+    let Ok(Wake::Play(job)) = receiver.try_recv() else {
+        panic!("a preview is queued as a sound");
+    };
     assert!(matches!(job.request, PlaybackRequest::Preview));
     assert!(Arc::ptr_eq(&job.cancel, &service.stop));
     assert!(receiver.try_recv().is_err());
@@ -425,7 +429,7 @@ fn worker_continues_after_backend_error_without_replaying() {
             .sender
             .as_ref()
             .unwrap()
-            .send(Job {
+            .send(Wake::Play(Box::new(Job {
                 request: PlaybackRequest::Notification {
                     boot: None,
                     event: notification,
@@ -433,7 +437,7 @@ fn worker_continues_after_backend_error_without_replaying() {
                 cancel: Arc::new(AtomicBool::new(false)),
                 connection_cancel: Arc::new(AtomicBool::new(false)),
                 queued: Instant::now(),
-            })
+            })))
             .unwrap();
         assert_eq!(played.recv_timeout(Duration::from_secs(3)).unwrap(), sound);
     }
@@ -452,7 +456,7 @@ fn worker_drops_cancelled_and_expired_jobs_without_playing_them() {
             .sender
             .as_ref()
             .unwrap()
-            .send(Job {
+            .send(Wake::Play(Box::new(Job {
                 request: PlaybackRequest::Notification {
                     boot: None,
                     event: event(Kind::Custom),
@@ -460,7 +464,7 @@ fn worker_drops_cancelled_and_expired_jobs_without_playing_them() {
                 cancel: Arc::new(AtomicBool::new(cancelled)),
                 connection_cancel: Arc::new(AtomicBool::new(false)),
                 queued: Instant::now() - Duration::from_secs(age),
-            })
+            })))
             .unwrap();
     }
     assert_eq!(
@@ -478,3 +482,4 @@ fn worker_drops_cancelled_and_expired_jobs_without_playing_them() {
 mod play;
 mod repeats;
 mod volume;
+mod wake;

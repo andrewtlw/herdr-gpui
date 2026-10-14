@@ -81,6 +81,7 @@ mod navigation;
 mod notifications;
 mod orchestrator;
 mod osc52;
+mod pace;
 mod palette;
 mod pane_menu;
 mod pane_move;

@@ -31,6 +31,14 @@ const MAX_SOCKET: usize = 1024;
 /// is quicker; macOS has only `lsof`. Both list only this user's processes
 /// with their owners, so another user's servers never show. The step runs in
 /// a long-lived shell, so it must not `exit`.
+///
+/// A process's environment does not change, so the shell keeps what earlier
+/// scans read in `herdr_cache`, one `pid<TAB>name<TAB>workspace<TAB>socket`
+/// line per listener, and reads only listeners it has not seen. That matters
+/// on macOS, where one `ps` costs as much as reading every process: it runs
+/// at most once per scan, and not at all once the listeners are known. A
+/// listener is known by its id and name, and leaves the cache when it stops
+/// listening, so the cache never outgrows one scan.
 pub(crate) const COMMAND: &str = r#"PATH="$PATH:/usr/sbin:/sbin"
 if command -v ss >/dev/null 2>&1; then
     herdr_ports=$(ss -ltnp 2>/dev/null | awk '{
@@ -51,18 +59,64 @@ else
     herdr_ports=N
 fi
 printf '%s\n' "$herdr_ports"
-for herdr_pid in $(printf '%s\n' "$herdr_ports" | awk '$1 == "L" { print $2 }' | sort -un | head -n 128); do
+herdr_tab=$(printf '\t')
+herdr_listed=$(printf '%s\n' "$herdr_ports" | awk '$1 == "L" && !seen[$2]++ { print $2 "\t" $4 }' | sort -n | head -n 128)
+herdr_kept=$(printf '%s\n' "$herdr_listed" | herdr_cache="$herdr_cache" awk -F '\t' '
+    BEGIN {
+        n = split(ENVIRON["herdr_cache"], line, "\n")
+        for (i = 1; i <= n; i++) {
+            split(line[i], field, "\t")
+            if (field[1] != "") known[field[1] "\t" field[2]] = line[i]
+        }
+    }
+    $1 != "" && ($1 "\t" $2) in known { print known[$1 "\t" $2] }')
+herdr_new=$(printf '%s\n' "$herdr_listed" | herdr_kept="$herdr_kept" awk -F '\t' '
+    BEGIN {
+        n = split(ENVIRON["herdr_kept"], line, "\n")
+        for (i = 1; i <= n; i++) {
+            split(line[i], field, "\t")
+            kept[field[1] "\t" field[2]] = 1
+        }
+    }
+    $1 != "" && !(($1 "\t" $2) in kept)')
+herdr_found=
+herdr_ps=
+for herdr_pid in $(printf '%s\n' "$herdr_new" | cut -f 1); do
     if [ -r "/proc/$herdr_pid/environ" ]; then
         herdr_env=$(tr '\0' '\n' < "/proc/$herdr_pid/environ")
+        herdr_workspace=$(printf '%s\n' "$herdr_env" | sed -n 's/^HERDR_WORKSPACE_ID=//p' | head -n 1)
+        herdr_socket=$(printf '%s\n' "$herdr_env" | sed -n 's/^HERDR_SOCKET_PATH=//p' | head -n 1)
+        herdr_found="$herdr_found$herdr_pid$herdr_tab$herdr_workspace$herdr_tab$herdr_socket
+"
     else
-        herdr_env=$(ps -E -ww -o command= -p "$herdr_pid" 2>/dev/null | tr ' ' '\n')
-    fi
-    herdr_workspace=$(printf '%s\n' "$herdr_env" | sed -n 's/^HERDR_WORKSPACE_ID=//p' | head -n 1)
-    herdr_socket=$(printf '%s\n' "$herdr_env" | sed -n 's/^HERDR_SOCKET_PATH=//p' | head -n 1)
-    if [ -n "$herdr_workspace" ]; then
-        printf 'E %s %s %s\n' "$herdr_pid" "$herdr_workspace" "$herdr_socket"
+        herdr_ps="$herdr_ps${herdr_ps:+,}$herdr_pid"
     fi
 done
+if [ -n "$herdr_ps" ]; then
+    herdr_found="$herdr_found$(ps -E -ww -o pid= -o command= -p "$herdr_ps" 2>/dev/null | awk '{
+        workspace = ""
+        socket = ""
+        for (i = 2; i <= NF; i++) {
+            if (workspace == "" && index($i, "HERDR_WORKSPACE_ID=") == 1) {
+                workspace = substr($i, 20)
+            } else if (socket == "" && index($i, "HERDR_SOCKET_PATH=") == 1) {
+                socket = substr($i, 19)
+            }
+        }
+        printf "%s\t%s\t%s\n", $1, workspace, socket
+    }')"
+fi
+herdr_cache=$(printf '%s\n' "$herdr_new" | herdr_found="$herdr_found" awk -F '\t' '
+    BEGIN {
+        n = split(ENVIRON["herdr_found"], line, "\n")
+        for (i = 1; i <= n; i++) {
+            split(line[i], field, "\t")
+            if (field[1] != "") found[field[1]] = field[2] "\t" field[3]
+        }
+    }
+    $1 != "" { print $1 "\t" $2 "\t" (($1 in found) ? found[$1] : "\t") }')
+herdr_cache=$(printf '%s\n%s\n' "$herdr_kept" "$herdr_cache" | awk 'NF')
+printf '%s\n' "$herdr_cache" | awk -F '\t' '$3 != "" { printf "E %s %s %s\n", $1, $3, $4 }'
 true"#;
 
 /// The address a socket listens on, which decides how it can be reached.

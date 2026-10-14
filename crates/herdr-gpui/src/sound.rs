@@ -195,6 +195,14 @@ impl Recent {
     }
 }
 
+/// What wakes the worker. It blocks until one arrives, so an idle app does
+/// not wake it at all; dropping the service disconnects it and ends it.
+enum Wake {
+    Play(Box<Job>),
+    /// The local sound settings changed; read them again.
+    Reload,
+}
+
 struct Job {
     request: PlaybackRequest,
     cancel: Arc<AtomicBool>,
@@ -204,7 +212,7 @@ struct Job {
 
 #[derive(Default)]
 pub(crate) struct Service {
-    sender: Option<mpsc::SyncSender<Job>>,
+    sender: Option<mpsc::SyncSender<Wake>>,
     settings: Arc<Mutex<Option<Arc<Settings>>>>,
     reload: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -214,7 +222,14 @@ pub(crate) struct Service {
 
 impl Service {
     pub(crate) fn reload(&self) {
-        self.reload.store(true, Ordering::Release);
+        // One wake is enough for any number of reloads before the worker
+        // reads the flag, and a full queue wakes it anyway, so a reload never
+        // takes a slot a sound needs.
+        if !self.reload.swap(true, Ordering::AcqRel)
+            && let Some(sender) = &self.sender
+        {
+            let _ = sender.try_send(Wake::Reload);
+        }
     }
 
     /// Plays every later sound, previews included, at `percent` of its own
@@ -252,7 +267,10 @@ impl Service {
     ) -> Self {
         let mut service = Self::default();
         service.set_volume(crate::config::SoundConfig::default().volume);
-        let (sender, receiver) = mpsc::sync_channel::<Job>(8);
+        // Queued sounds, plus the one reload wake that may be waiting beside them.
+        let (sender, receiver) = mpsc::sync_channel::<Wake>(8 + 1);
+        // The first wake reads the settings before any sound is asked for.
+        let _ = sender.try_send(Wake::Reload);
         let settings = service.settings.clone();
         let volume = service.volume.clone();
         let reload = service.reload.clone();
@@ -264,10 +282,10 @@ impl Service {
                 let mut recent = Recent::default();
                 reload.store(true, Ordering::Release);
                 while !stop.load(Ordering::Acquire) {
-                    let job = match receiver.recv_timeout(Duration::from_millis(50)) {
-                        Ok(job) => Some(job),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    let job = match receiver.recv() {
+                        Ok(Wake::Play(job)) => Some(job),
+                        Ok(Wake::Reload) => None,
+                        Err(mpsc::RecvError) => break,
                     };
                     if reload.swap(false, Ordering::AcqRel) {
                         match load() {
@@ -342,12 +360,12 @@ impl Service {
     fn request(&self, request: PlaybackRequest) -> bool {
         self.sender.as_ref().is_some_and(|sender| {
             sender
-                .try_send(Job {
+                .try_send(Wake::Play(Box::new(Job {
                     request,
                     cancel: self.stop.clone(),
                     connection_cancel: self.stop.clone(),
                     queued: Instant::now(),
-                })
+                })))
                 .is_ok()
         })
     }
@@ -409,7 +427,7 @@ impl Service {
             now,
             |event| {
                 if let Some(sender) = &self.sender {
-                    let _ = sender.try_send(Job {
+                    let _ = sender.try_send(Wake::Play(Box::new(Job {
                         request: PlaybackRequest::Notification {
                             boot: snapshot.as_ref().map(|s| s.boot_id.clone()),
                             event,
@@ -417,7 +435,7 @@ impl Service {
                         cancel: cancel.clone(),
                         connection_cancel: connection_cancel.clone(),
                         queued: now,
-                    });
+                    })));
                 }
             },
         );
