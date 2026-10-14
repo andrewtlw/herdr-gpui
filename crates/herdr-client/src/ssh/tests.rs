@@ -4,6 +4,7 @@ mod command;
 mod forward;
 mod incompatible;
 mod probe_failure;
+mod process_group;
 mod windows_host;
 
 #[test]
