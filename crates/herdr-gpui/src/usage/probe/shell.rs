@@ -61,9 +61,9 @@ pub(crate) struct Shell {
 }
 
 impl Drop for Shell {
+    /// Over SSH this also ends the connection's `ProxyCommand`.
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        herdr_client::end_process_group(&mut self.child);
     }
 }
 
@@ -93,8 +93,7 @@ impl Shell {
         };
         let mut child = command.spawn().map_err(process)?;
         let (Some(stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            let _ = child.kill();
-            let _ = child.wait();
+            herdr_client::end_process_group(&mut child);
             return Err(process(std::io::Error::other("no pipes")));
         };
         let (sender, output) = mpsc::sync_channel(64);
@@ -119,8 +118,7 @@ impl Shell {
                 }
             });
         if let Err(source) = reader {
-            let _ = child.kill();
-            let _ = child.wait();
+            herdr_client::end_process_group(&mut child);
             return Err(process(source));
         }
         let mut shell = Self {

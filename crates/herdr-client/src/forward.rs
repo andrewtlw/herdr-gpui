@@ -136,7 +136,13 @@ impl PortForward {
         let mut slot = lock(&self.slot);
         slot.stopped = true;
         if let Some(child) = &mut slot.child {
-            // A child the worker already reaped is not signalled again.
+            // A child the worker already reaped is not signalled again. The
+            // group holds the master's `ProxyCommand` too; the worker reaps.
+            #[cfg(unix)]
+            let _ = rustix::process::kill_process_group(
+                rustix::process::Pid::from_child(child),
+                rustix::process::Signal::KILL,
+            );
             let _ = child.kill();
         }
     }
@@ -264,8 +270,7 @@ fn run(
     );
     let child = lock(slot).child.take();
     if let Some(mut child) = child {
-        let _ = child.kill();
-        let _ = child.wait();
+        crate::ssh::end_process_group(&mut child);
     }
     if let Some(error) = ended {
         let _ = events.try_send(ForwardEvent::Ended(error));
@@ -371,7 +376,10 @@ fn control_path(socket: &Path) -> String {
 /// `RemoteForward` from the user's config that is busy elsewhere cannot end it.
 #[cfg(unix)]
 fn master_command(target: &str, socket: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
     let mut command = crate::environment::command("ssh");
+    // Its own group, which its `ProxyCommand` joins; see `end_process_group`.
+    command.process_group(0);
     command
         .args([
             "-N",

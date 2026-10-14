@@ -30,13 +30,30 @@ mod powershell;
 const READY: &[u8] = b"herdr-remote-output-ready:1\n";
 
 /// A bridge, probe, or script child (`ssh`, or `wsl.exe` on Windows), killed
-/// and reaped on every exit path.
+/// with its process group and reaped on every exit path.
 pub(crate) struct ChildGuard(pub(crate) Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        end_process_group(&mut self.0);
     }
+}
+
+/// Kills `child` and, when it leads its own process group, everything else
+/// in that group, then reaps it.
+///
+/// `ssh` children lead their own group (see `noninteractive`), so this also
+/// ends the `ProxyCommand` they started. Killed `ssh` cannot stop its proxy
+/// itself, and a proxy left behind, such as `sft proxycommand` after a wake,
+/// can keep a core busy for hours. Only a child still unreaped is signalled
+/// as a group: until it is reaped, its id cannot name anyone else's group.
+pub fn end_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    if matches!(child.try_wait(), Ok(None)) {
+        let group = rustix::process::Pid::from_child(child);
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(super) use crate::script::shell_quote as quote;
@@ -459,11 +476,14 @@ pub(super) fn command(target: &str, remote_command: &str) -> Command {
     command
 }
 
-/// `ssh` with the bridge's connection policy and nothing to connect yet.
+/// `ssh` with the bridge's connection policy and nothing to connect yet. It
+/// leads a new process group, which its `ProxyCommand` joins, so
+/// [`end_process_group`] ends both.
 #[cfg(unix)]
 fn noninteractive() -> Command {
+    use std::os::unix::process::CommandExt;
     let mut command = crate::environment::command("ssh");
-    command.args(POLICY);
+    command.args(POLICY).process_group(0);
     command
 }
 
